@@ -14,30 +14,38 @@ A fast, lightweight native C++/Qt6 file preview utility designed for KDE Plasma 
 ## Prerequisites
 
 Make sure you have Qt6 development packages and CMake installed on your system (e.g., openSUSE Tumbleweed, Arch Linux, or Fedora):
-
 ```bash
 # openSUSE Tumbleweed example
 sudo zypper install cmake gcc-c++ qt6-base-devel qt6-multimedia-devel qt6-pdf-devel qt6-dbus-devel libreoffice
+```
 
-Building and Installation
+## Building and Installation
 Clone the repository and compile using CMake:
 
-git clone [https://github.com/your-username/kde-sashimi.git](https://github.com/your-username/kde-sashimi.git)
+```bash
+git clone [https://github.com/chirawoot/kde-sashimi.git](https://github.com/chirawoot/kde-sashimi.git)
 cd kde-sashimi
+```
 
 # Configure and Build
+```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+```
 
 # Install to system (e.g., /usr/local/bin)
+```bash
 sudo cmake --install build
+```
 
-Usage
+# Usage
+
 You can launch it directly from the terminal:
-
+```bash
 kde-sashimi /path/to/image.png
+```
+# Integrating with KDE Dolphin:
 
-Integrating with KDE Dolphin:
-Open Dolphin Settings -> General -> Services (or use Custom Actions).
+1. Open Dolphin Settings -> General -> Services (or use Custom Actions).
 
-Create a new Service/Action to run kde-sashimi %f when a file is selected or triggered.
+2. Create a new Service/Action to run kde-sashimi %f when a file is selected or triggered.
