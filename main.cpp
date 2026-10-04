@@ -26,6 +26,12 @@
 #include <QCryptographicHash>
 #include <QDBusInterface>
 #include <QDBusReply>
+#include <QListWidget>
+#include <QListWidgetItem>
+#include <QSlider>
+#include <QStyle>
+#include <QFileIconProvider>
+#include <QTimer>
 #include <iostream>
 
 const QString SOCKET_NAME = "kde_sashimi_cpp_single_instance";
@@ -34,7 +40,8 @@ class AutoFitLabel : public QLabel {
 public:
     AutoFitLabel(const QPixmap &pixmap, QWidget *parent = nullptr) : QLabel(parent), m_pixmap(pixmap) {
         setAlignment(Qt::AlignCenter);
-        setMinimumSize(200, 200);
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        setMinimumSize(50, 50);
     }
 
 protected:
@@ -114,13 +121,17 @@ public:
         m_contentWidget->setLayout(m_layout);
         rootLayout->addWidget(m_contentWidget, 1);
 
-        loadFile(filePath, false);
+        // [แก้ไขที่นี่] ใช้ QTimer หน่วงเวลา 0 วินาที เพื่อให้รอ app.exec() เริ่มงานก่อน
+        // ป้องกันแอปแครชจากการพยายามดึงไฟล์ไอคอนตอนโปรแกรมเพิ่งเริ่ม
+        QTimer::singleShot(0, this, [this, filePath]() {
+            loadFile(filePath, false);
+        });
     }
 
     void updateFolderFileList() {
         QFileInfo current(m_filePath);
-        QDir dir = current.dir();
-        m_folderFiles = dir.entryList(QDir::Files, QDir::Name | QDir::IgnoreCase);
+        QDir parentDir = current.isDir() ? current.dir() : current.dir();
+        m_folderFiles = parentDir.entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name | QDir::IgnoreCase);
         m_currentFileIndex = m_folderFiles.indexOf(current.fileName());
     }
 
@@ -147,7 +158,7 @@ public:
     }
 
     void openWithDefaultApp() {
-        if (QFile::exists(m_filePath)) {
+        if (QFileInfo::exists(m_filePath)) {
             QDesktopServices::openUrl(QUrl::fromLocalFile(m_filePath));
         }
     }
@@ -158,6 +169,19 @@ public:
             delete m_player;
             m_player = nullptr;
         }
+
+        if (m_officeProcess) {
+            m_officeProcess->kill();
+            m_officeProcess->deleteLater();
+            m_officeProcess = nullptr;
+        }
+        
+        if (m_currentPdfDoc) {
+            delete m_currentPdfDoc;
+            m_currentPdfDoc = nullptr;
+        }
+        m_pdfScrollLayout = nullptr;
+        m_pdfLoadingLabel = nullptr;
 
         QLayoutItem *item;
         while ((item = m_layout->takeAt(0)) != nullptr) {
@@ -170,12 +194,21 @@ public:
 
     void loadFile(const QString &filePath, bool syncToDolphin = false) {
         clearLayout();
-        m_filePath = QFileInfo(filePath).absoluteFilePath();
+        
+        QString cleanPath = filePath;
+        if (cleanPath.startsWith("file://")) {
+            cleanPath = QUrl(cleanPath).toLocalFile();
+        }
+        
+        m_filePath = QFileInfo(cleanPath).absoluteFilePath();
         updateFolderFileList();
 
         QFileInfo fi(m_filePath);
         setWindowTitle(QString("kde-sashimi: %1").arg(fi.fileName()));
-        m_fileInfoLabel->setText(QString("%1 (%2/%3)").arg(fi.fileName()).arg(m_currentFileIndex + 1).arg(m_folderFiles.size()));
+        
+        int totalItems = m_folderFiles.size();
+        int currentIndex = (m_currentFileIndex >= 0) ? m_currentFileIndex + 1 : 0;
+        m_fileInfoLabel->setText(QString("%1 (%2/%3)").arg(fi.fileName()).arg(currentIndex).arg(totalItems));
 
         if (syncToDolphin) {
             QDBusInterface fm("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1", QDBusConnection::sessionBus());
@@ -186,10 +219,21 @@ public:
             }
         }
 
-        if (!QFile::exists(m_filePath)) {
-            QLabel *label = new QLabel(QString("File not found:\n%1").arg(m_filePath), this);
+        if (!fi.exists()) {
+            QLabel *label = new QLabel(QString("File or Directory not found:\n%1").arg(m_filePath), this);
             label->setAlignment(Qt::AlignCenter);
             m_layout->addWidget(label);
+            show();
+            raise();
+            activateWindow();
+            return;
+        }
+
+        if (fi.isDir()) {
+            previewFolder();
+            show();
+            raise();
+            activateWindow();
             return;
         }
 
@@ -225,6 +269,139 @@ public:
     }
 
 private:
+    QWidget* createMediaControls(QMediaPlayer *player, QAudioOutput *audioOutput) {
+        QWidget *controlWidget = new QWidget(this);
+        QHBoxLayout *controlLayout = new QHBoxLayout(controlWidget);
+        controlLayout->setContentsMargins(0, 5, 0, 0);
+
+        QPushButton *btnPlayPause = new QPushButton(style()->standardIcon(QStyle::SP_MediaPause), "", controlWidget);
+        QPushButton *btnStop = new QPushButton(style()->standardIcon(QStyle::SP_MediaStop), "", controlWidget);
+        QSlider *seekSlider = new QSlider(Qt::Horizontal, controlWidget);
+        QLabel *lblTime = new QLabel("00:00 / 00:00", controlWidget);
+        QSlider *volumeSlider = new QSlider(Qt::Horizontal, controlWidget);
+        
+        volumeSlider->setRange(0, 100);
+        volumeSlider->setValue(qRound(audioOutput->volume() * 100));
+        volumeSlider->setMaximumWidth(100);
+
+        controlLayout->addWidget(btnPlayPause);
+        controlLayout->addWidget(btnStop);
+        controlLayout->addWidget(seekSlider);
+        controlLayout->addWidget(lblTime);
+        controlLayout->addWidget(new QLabel("🔊", controlWidget));
+        controlLayout->addWidget(volumeSlider);
+
+        auto formatTime = [](qint64 ms) -> QString {
+            qint64 s = ms / 1000;
+            qint64 m = s / 60;
+            s = s % 60;
+            return QString("%1:%2").arg(m, 2, 10, QChar('0')).arg(s, 2, 10, QChar('0'));
+        };
+
+        connect(btnPlayPause, &QPushButton::clicked, [player, btnPlayPause, this]() {
+            if (player->playbackState() == QMediaPlayer::PlayingState) {
+                player->pause();
+                btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+            } else {
+                player->play();
+                btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPause));
+            }
+        });
+
+        connect(btnStop, &QPushButton::clicked, [player, btnPlayPause, this]() {
+            player->stop();
+            btnPlayPause->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+        });
+
+        connect(player, &QMediaPlayer::positionChanged, [seekSlider, lblTime, formatTime, player](qint64 position) {
+            if (!seekSlider->isSliderDown()) {
+                seekSlider->setValue(position);
+            }
+            lblTime->setText(QString("%1 / %2").arg(formatTime(position)).arg(formatTime(player->duration())));
+        });
+
+        connect(player, &QMediaPlayer::durationChanged, [seekSlider, lblTime, formatTime](qint64 duration) {
+            seekSlider->setRange(0, duration);
+            lblTime->setText(QString("00:00 / %1").arg(formatTime(duration)));
+        });
+
+        connect(seekSlider, &QSlider::sliderMoved, player, &QMediaPlayer::setPosition);
+
+        connect(volumeSlider, &QSlider::valueChanged, [audioOutput](int value) {
+            audioOutput->setVolume(value / 100.0);
+        });
+
+        return controlWidget;
+    }
+
+    void previewFolder() {
+        QDir dir(m_filePath);
+        QFileInfoList entries = dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDir::DirsFirst | QDir::Name | QDir::IgnoreCase);
+
+        qint64 totalSize = 0;
+        int fileCount = 0;
+        int dirCount = 0;
+
+        QListWidget *listWidget = new QListWidget(this);
+        listWidget->setViewMode(QListWidget::IconMode);
+        listWidget->setIconSize(QSize(64, 64));
+        listWidget->setResizeMode(QListWidget::Adjust);
+        listWidget->setMovement(QListView::Static);
+        listWidget->setSpacing(12);
+        listWidget->setWordWrap(true);
+        listWidget->setStyleSheet(
+            "QListWidget { font-size: 12px; padding: 10px; background-color: transparent; border: none; }"
+            "QListWidget::item { padding: 8px; border-radius: 6px; }"
+            "QListWidget::item:hover { background-color: rgba(128, 128, 128, 0.2); }"
+        );
+
+        QFileIconProvider iconProvider;
+
+        for (const QFileInfo &entry : entries) {
+            QString sizeStr;
+            if (entry.isDir()) {
+                dirCount++;
+            } else {
+                fileCount++;
+                totalSize += entry.size();
+                double kb = entry.size() / 1024.0;
+                if (kb < 1024) {
+                    sizeStr = QString::number(kb, 'f', 1) + " KB";
+                } else {
+                    sizeStr = QString::number(kb / 1024.0, 'f', 1) + " MB";
+                }
+            }
+
+            QIcon icon = iconProvider.icon(entry);
+            QString itemText = entry.fileName();
+            if (!entry.isDir()) {
+                itemText += "\n(" + sizeStr + ")";
+            }
+
+            QListWidgetItem *item = new QListWidgetItem(icon, itemText, listWidget);
+            item->setData(Qt::UserRole, entry.absoluteFilePath());
+            item->setTextAlignment(Qt::AlignHCenter | Qt::AlignBottom);
+            item->setToolTip(entry.fileName() + (entry.isDir() ? "" : " - " + sizeStr));
+        }
+
+        connect(listWidget, &QListWidget::itemDoubleClicked, [this](QListWidgetItem *item) {
+            QString selectedPath = item->data(Qt::UserRole).toString();
+            if (!selectedPath.isEmpty()) {
+                loadFile(selectedPath, true);
+            }
+        });
+
+        QLabel *statsLabel = new QLabel(QString("📁 <b>%1</b><br/>📊 %2 Folders, %3 Files (Total Size: %4 MB)")
+                                           .arg(dir.dirName().isEmpty() ? m_filePath : dir.dirName())
+                                           .arg(dirCount)
+                                           .arg(fileCount)
+                                           .arg(QString::number(totalSize / (1024.0 * 1024.0), 'f', 2)), this);
+        statsLabel->setStyleSheet("font-size: 14px; padding: 12px; color: #eee; background-color: rgba(0, 0, 0, 0.3); border-radius: 6px; margin-bottom: 5px;");
+
+        m_layout->addWidget(statsLabel);
+        m_layout->addWidget(listWidget);
+    }
+
     void previewOffice() {
         QString cacheDir = QDir::tempPath() + "/kde_sashimi_cache";
         QDir().mkpath(cacheDir);
@@ -238,71 +415,129 @@ private:
             return;
         }
 
-        QProcess libreoffice;
-        libreoffice.start("libreoffice", QStringList() << "--headless" << "--convert-to" << "pdf" << m_filePath << "--outdir" << cacheDir);
-        if (libreoffice.waitForFinished(10000)) {
-            QString baseName = fileInfo.completeBaseName();
+        QLabel *loadingLabel = new QLabel(QString("⏳ กำลังเตรียมการพรีวิวไฟล์ %1...\n(กระบวนการนี้ใช้เวลาสักครู่เฉพาะการเปิดครั้งแรก)").arg(fileInfo.fileName()), this);
+        loadingLabel->setAlignment(Qt::AlignCenter);
+        loadingLabel->setStyleSheet("font-size: 16px; color: #999; font-weight: bold;");
+        m_layout->addWidget(loadingLabel);
+
+        QString profileDir = cacheDir + "/lo_profile_" + hashKey;
+        QDir().mkpath(profileDir);
+
+        m_officeProcess = new QProcess(this);
+        QStringList args;
+        args << QString("-env:UserInstallation=file://%1").arg(profileDir)
+             << "--headless"
+             << "--convert-to" << "pdf"
+             << m_filePath
+             << "--outdir" << cacheDir;
+
+        QString baseName = fileInfo.completeBaseName();
+        QString originalFilePath = m_filePath;
+
+        connect(m_officeProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), [this, originalFilePath, cacheDir, baseName, cachedPdfPath, profileDir]() {
+            if (m_filePath != originalFilePath) return;
+
             QString generatedPdf = cacheDir + "/" + baseName + ".pdf";
-            
+            clearLayout(); 
+
             if (QFile::exists(generatedPdf)) {
                 if (generatedPdf != cachedPdfPath) {
                     QFile::rename(generatedPdf, cachedPdfPath);
                 }
+                QDir(profileDir).removeRecursively();
                 previewPdf(cachedPdfPath);
-                return;
+            } else {
+                QLabel *errorLabel = new QLabel("❌ ไม่สามารถแปลงไฟล์ Office ได้\nโปรดตรวจสอบว่าติดตั้ง LibreOffice แล้วหรือไม่", this);
+                errorLabel->setAlignment(Qt::AlignCenter);
+                errorLabel->setStyleSheet("font-size: 14px; color: #ff6666;");
+                m_layout->addWidget(errorLabel);
             }
-        }
 
-        QLabel *errorLabel = new QLabel("Failed to convert Office document.", this);
-        errorLabel->setAlignment(Qt::AlignCenter);
-        m_layout->addWidget(errorLabel);
+            if (m_officeProcess) {
+                m_officeProcess->deleteLater();
+                m_officeProcess = nullptr;
+            }
+        });
+
+        m_officeProcess->start("libreoffice", args);
     }
 
     void previewPdf(const QString &pdfPath) {
-        QPdfDocument *pdfDoc = new QPdfDocument(this);
-        if (pdfDoc->load(pdfPath) == QPdfDocument::Error::None && pdfDoc->pageCount() > 0) {
+        m_currentPdfDoc = new QPdfDocument(this);
+        if (m_currentPdfDoc->load(pdfPath) == QPdfDocument::Error::None && m_currentPdfDoc->pageCount() > 0) {
             QScrollArea *scrollArea = new QScrollArea(this);
             scrollArea->setWidgetResizable(true);
 
             QWidget *container = new QWidget();
-            QVBoxLayout *scrollLayout = new QVBoxLayout(container);
-            scrollLayout->setAlignment(Qt::AlignHCenter);
-            scrollLayout->setSpacing(10);
+            m_pdfScrollLayout = new QVBoxLayout(container);
+            m_pdfScrollLayout->setAlignment(Qt::AlignHCenter);
+            m_pdfScrollLayout->setSpacing(10);
 
-            QSize page0Size = pdfDoc->pagePointSize(0).toSize() * 1.5;
-            QLabel *page0Label = new QLabel();
-            page0Label->setPixmap(QPixmap::fromImage(pdfDoc->render(0, page0Size)));
-            page0Label->setStyleSheet("border: 1px solid #444;");
-            scrollLayout->addWidget(page0Label);
-
-            container->setLayout(scrollLayout);
+            container->setLayout(m_pdfScrollLayout);
             scrollArea->setWidget(container);
             m_layout->addWidget(scrollArea);
 
-            int pageCount = pdfDoc->pageCount();
-            if (pageCount > 1) {
-                for (int i = 1; i < pageCount; ++i) {
-                    QSize pageSize = pdfDoc->pagePointSize(i).toSize() * 1.5;
-                    QLabel *pageLabel = new QLabel();
-                    pageLabel->setPixmap(QPixmap::fromImage(pdfDoc->render(i, pageSize)));
-                    pageLabel->setStyleSheet("border: 1px solid #444;");
-                    scrollLayout->addWidget(pageLabel);
-                }
-            }
+            m_pdfTotalPages = m_currentPdfDoc->pageCount();
+            m_pdfCurrentPage = 0;
+
+            m_pdfLoadingLabel = new QLabel(QString("⏳ กำลังเรนเดอร์หน้า (0/%1)...").arg(m_pdfTotalPages));
+            m_pdfLoadingLabel->setAlignment(Qt::AlignCenter);
+            m_pdfLoadingLabel->setStyleSheet("font-size: 14px; color: #aaa; font-weight: bold; padding: 15px;");
+            m_pdfScrollLayout->addWidget(m_pdfLoadingLabel);
+
+            QString currentPath = m_filePath;
+            QTimer::singleShot(5, this, [this, currentPath]() {
+                renderNextPdfPage(currentPath);
+            });
         } else {
-            QLabel *errLabel = new QLabel("Error loading PDF.", this);
+            QLabel *errLabel = new QLabel("❌ เกิดข้อผิดพลาดในการโหลด PDF", this);
             errLabel->setAlignment(Qt::AlignCenter);
+            errLabel->setStyleSheet("font-size: 14px; color: #ff6666;");
             m_layout->addWidget(errLabel);
+        }
+    }
+
+    void renderNextPdfPage(const QString &expectedPath) {
+        if (expectedPath != m_filePath || !m_currentPdfDoc || !m_pdfScrollLayout) return;
+
+        if (m_pdfCurrentPage < m_pdfTotalPages) {
+            QSize pageSize = m_currentPdfDoc->pagePointSize(m_pdfCurrentPage).toSize() * 1.5;
+            QImage img = m_currentPdfDoc->render(m_pdfCurrentPage, pageSize);
+            
+            QLabel *pageLabel = new QLabel();
+            pageLabel->setPixmap(QPixmap::fromImage(img));
+            pageLabel->setStyleSheet("border: 1px solid #444; background-color: white;");
+            
+            if (m_pdfLoadingLabel) {
+                int index = m_pdfScrollLayout->indexOf(m_pdfLoadingLabel);
+                m_pdfScrollLayout->insertWidget(index, pageLabel);
+                
+                m_pdfCurrentPage++;
+                m_pdfLoadingLabel->setText(QString("⏳ กำลังเรนเดอร์หน้า %1 จาก %2...").arg(m_pdfCurrentPage).arg(m_pdfTotalPages));
+            }
+
+            QTimer::singleShot(5, this, [this, expectedPath]() { 
+                renderNextPdfPage(expectedPath); 
+            });
+        } else {
+            if (m_pdfLoadingLabel) {
+                m_pdfLoadingLabel->deleteLater();
+                m_pdfLoadingLabel = nullptr;
+            }
         }
     }
 
     void previewVideo() {
         m_player = new QMediaPlayer(this);
         QAudioOutput *audioOutput = new QAudioOutput(this);
+        audioOutput->setVolume(0.5);
         m_player->setAudioOutput(audioOutput);
 
         QVideoWidget *videoWidget = new QVideoWidget(this);
-        m_layout->addWidget(videoWidget);
+        videoWidget->setAspectRatioMode(Qt::KeepAspectRatio); 
+        
+        m_layout->addWidget(videoWidget, 1);
+        m_layout->addWidget(createMediaControls(m_player, audioOutput), 0);
 
         m_player->setVideoOutput(videoWidget);
         m_player->setSource(QUrl::fromLocalFile(m_filePath));
@@ -312,11 +547,15 @@ private:
     void previewAudio() {
         QLabel *title = new QLabel(QString("🎵 Playing: <b>%1</b>").arg(QFileInfo(m_filePath).fileName()), this);
         title->setAlignment(Qt::AlignCenter);
-        m_layout->addWidget(title);
+        title->setStyleSheet("font-size: 16px; margin: 20px;");
+        m_layout->addWidget(title, 1);
 
         m_player = new QMediaPlayer(this);
         QAudioOutput *audioOutput = new QAudioOutput(this);
+        audioOutput->setVolume(0.5);
         m_player->setAudioOutput(audioOutput);
+
+        m_layout->addWidget(createMediaControls(m_player, audioOutput), 0);
 
         m_player->setSource(QUrl::fromLocalFile(m_filePath));
         m_player->play();
@@ -336,7 +575,7 @@ private:
         m_layout->addWidget(edit);
     }
 
-    Widget *m_contentWidget = nullptr;
+    QWidget *m_contentWidget = nullptr;
     QVBoxLayout *m_layout = nullptr;
     QLabel *m_fileInfoLabel = nullptr;
     QPushButton *m_btnPrev = nullptr;
@@ -346,17 +585,29 @@ private:
     QString m_filePath;
     QStringList m_folderFiles;
     int m_currentFileIndex = -1;
+    
     QMediaPlayer *m_player = nullptr;
+    QProcess *m_officeProcess = nullptr; 
+
+    QPdfDocument *m_currentPdfDoc = nullptr;
+    QVBoxLayout *m_pdfScrollLayout = nullptr;
+    QLabel *m_pdfLoadingLabel = nullptr;
+    int m_pdfCurrentPage = 0;
+    int m_pdfTotalPages = 0;
 };
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        std::cout << "Usage: kde-sashimi <file_path>" << std::endl;
+        std::cout << "Usage: kde-sashimi <file_path_or_dir>" << std::endl;
         return 1;
     }
 
     QApplication app(argc, argv);
-    QString targetFile = QFileInfo(argv[1]).absoluteFilePath();
+    QString targetFile = argv[1];
+    if (targetFile.startsWith("file://")) {
+        targetFile = QUrl(targetFile).toLocalFile();
+    }
+    targetFile = QFileInfo(targetFile).absoluteFilePath();
 
     QLocalSocket socket;
     socket.connectToServer(SOCKET_NAME);
@@ -378,7 +629,10 @@ int main(int argc, char *argv[]) {
         if (clientSocket) {
             QObject::connect(clientSocket, &QLocalSocket::readyRead, [&preview, clientSocket]() {
                 QString newFile = QString::fromUtf8(clientSocket->readAll()).trimmed();
-                if (!newFile.isEmpty() && QFile::exists(newFile)) {
+                if (newFile.startsWith("file://")) {
+                    newFile = QUrl(newFile).toLocalFile();
+                }
+                if (!newFile.isEmpty() && QFileInfo::exists(newFile)) {
                     preview.loadFile(newFile, false);
                 }
                 clientSocket->disconnectFromServer();
